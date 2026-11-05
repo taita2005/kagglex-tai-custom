@@ -8,7 +8,8 @@ Reference of all `kagglex` commands, flags, and options.
 | --------------- | ----------------------------- |
 | `-v, --verbose` | Enable debug logging output   |
 | `-q, --quiet`   | Suppress non-error log output |
-| `--help`        | Show help message and exit    |
+| `--help`        | Show help message and exit, plus a full reference of every command and flag |
+| `-V, --version` | Print the installed kagglex version |
 
 ## kagglex run
 
@@ -46,6 +47,7 @@ kagglex run [OPTIONS]
 | `--stream`                  | Flag                | False          | Stream remote logs in real-time                       |
 | `--no-pull`                 | Flag                | False          | Skip downloading outputs after completion             |
 | `--dry-run`                 | Flag                | False          | Stage project locally without submitting to Kaggle    |
+| `--account NAME`            | String              | Default account | Named account to run on, or `auto` (most remaining quota) |
 
 ## kagglex exec
 
@@ -85,13 +87,14 @@ kagglex quota [OPTIONS]
 | `--days DAYS`       | Integer | `7`     | Number of days in the rolling calculation window |
 | `--gpu-limit HOURS` | Float   | `30.0`  | Weekly GPU quota limit in hours                  |
 | `--tpu-limit HOURS` | Float   | `20.0`  | Weekly TPU quota limit in hours                  |
+| `--account NAME`    | String  | All     | Only count runs of this named account            |
 
 ## kagglex list
 
 List recent experiment runs recorded in `~/.kagglex/runs.json`.
 
 ```bash
-kagglex list [--limit N]
+kagglex list [--limit N] [--credit]
 ```
 
 ### Options
@@ -99,14 +102,17 @@ kagglex list [--limit N]
 | Flag        | Type    | Default | Description                              |
 | ----------- | ------- | ------- | ---------------------------------------- |
 | `--limit N` | Integer | `20`    | Maximum number of run records to display |
+| `--credit`  | Flag    | False   | Show accounts and estimated quota instead (same as `kagglex account list`) |
 
 ## kagglex cancel
 
 Cancel an active Kaggle kernel.
 
 ```bash
-kagglex cancel <KERNEL_ID_OR_SLUG>
+kagglex cancel <KERNEL_ID_OR_SLUG> [--account NAME]
 ```
+
+`status`, `logs`, `pull` and `cancel` automatically use the account that submitted the run. Use `--account NAME` to override.
 
 ## kagglex dataset push
 
@@ -124,3 +130,16 @@ kagglex dataset push [OPTIONS]
 | `--title TITLE` | String | Required       | Dataset title                        |
 | `--slug SLUG`   | String | Auto-generated | Dataset slug                         |
 | `--public`      | Flag   | False          | Make dataset publicly accessible     |
+| `--account NAME` | String | Default account | Account that will own the dataset |
+
+## kagglex account
+
+Manage named Kaggle accounts stored in `~/.kagglex/accounts.toml`. See [Multiple Kaggle Accounts](user-guide/accounts.md).
+
+| Command | Description |
+| ------- | ----------- |
+| `kagglex account add NAME --username USER [--key KEY \| --token TOKEN \| --json PATH] [--default] [--force] [--verify]` | Register an account. Prompts for the key/token with hidden input if none is given |
+| `kagglex account list [--days N] [--gpu-limit H] [--tpu-limit H]` | Show accounts with estimated GPU/TPU used and remaining |
+| `kagglex account test [NAME ...]` | Contact Kaggle with each account (default: all) and report OK/FAIL |
+| `kagglex account use NAME` | Set the default account |
+| `kagglex account remove NAME` | Delete a stored account |

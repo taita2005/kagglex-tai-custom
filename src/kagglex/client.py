@@ -1,6 +1,8 @@
 """Kaggle API client wrapper for pre-flight checks, kernel dispatch, monitoring, and output sync."""
 
+import contextlib
 import fnmatch
+import io
 import json
 import logging
 import shutil
@@ -26,22 +28,130 @@ DEFAULT_OUTPUT_EXCLUDES = [
 ]
 
 
-def get_kaggle_api() -> Any:
-    """Instantiate and authenticate KaggleApi client."""
-    try:
+def _import_kaggle_api_class() -> Any:
+    # Importing the `kaggle` package runs an authentication attempt at import
+    # time that prints a long help banner when no default credentials exist
+    # (normal when only kagglex named accounts are configured). Silence it.
+    with contextlib.redirect_stdout(io.StringIO()):
         from kaggle.api.kaggle_api_extended import (
             KaggleApi,  # type: ignore[import-untyped]
         )
+    return KaggleApi
 
-        api = KaggleApi()
-        api.authenticate()
+
+def _apply_account_credentials(api: Any, account: Any) -> None:
+    """Authenticate `api` with a kagglex named account, bypassing Kaggle's own lookup.
+
+    Kaggle's lookup prefers KAGGLE_API_TOKEN / ~/.kaggle/access_token over any
+    username+key, which would silently run jobs on the wrong account.
+    """
+    try:
+        values = dict(api.read_config_file(quiet=True) or {})
+    except Exception:
+        values = {}
+    # Keep non-credential settings (proxy, path, ...) but drop every credential.
+    for k in ("username", "key", "token", "api_token", "auth_method"):
+        values.pop(k, None)
+
+    values["username"] = account.username
+    if account.token:
+        values["token"] = account.token
+    else:
+        values["key"] = account.key
+
+    try:
+        from kaggle.api.kaggle_api_extended import (
+            AuthMethod,  # type: ignore[import-untyped]
+        )
+
+        method = AuthMethod.ACCESS_TOKEN if account.token else AuthMethod.LEGACY_API_KEY
+        values["auth_method"] = str(method)
+    except ImportError:
+        pass  # older kaggle releases have no AuthMethod
+
+    api.config_values = values
+    api._authenticated = True
+
+    if account.token:
+        return
+
+    # kagglesdk's HTTP client also consults KAGGLE_API_TOKEN / ~/.kaggle/access_token
+    # before username+key. Pin the session auth to this account's key instead.
+    original_build = getattr(api, "build_kaggle_client", None)
+    if original_build is None:
+        return
+
+    def build_pinned_client() -> Any:
+        client = original_build()
+        http = getattr(client, "_http_client", None)
+        if http is not None and hasattr(http, "_try_fill_auth"):
+
+            def fill_auth() -> None:
+                http._session.auth = (account.username, account.key)
+                http._signed_in = True
+
+            http._try_fill_auth = fill_auth
+        return client
+
+    api.build_kaggle_client = build_pinned_client
+
+
+def get_kaggle_api() -> Any:
+    """Instantiate and authenticate a KaggleApi client.
+
+    Uses the active kagglex named account if one is set (see kagglex.accounts),
+    otherwise Kaggle's default credential lookup (~/.kaggle/kaggle.json, env vars).
+    """
+    from kagglex.accounts import get_active_account
+
+    account = get_active_account()
+    try:
+        api = _import_kaggle_api_class()()
+        if account is not None:
+            _apply_account_credentials(api, account)
+        else:
+            api.authenticate()
         return api
-    except Exception as e:
+    except (Exception, SystemExit) as e:
+        # kaggle's authenticate() calls exit(1) when no credentials are found.
         logger.error("Failed to authenticate Kaggle API: %s", e)
         raise RuntimeError(
-            "Kaggle API authentication failed. Ensure ~/.kaggle/kaggle.json exists or "
-            "KAGGLE_USERNAME and KAGGLE_KEY environment variables are set."
+            f"Kaggle API authentication failed ({type(e).__name__}: {e}). Add an account with "
+            "`kagglex account add <name> --username <kaggle-username>`, or ensure "
+            "~/.kaggle/kaggle.json exists or KAGGLE_USERNAME and KAGGLE_KEY are set."
         ) from e
+
+
+def verify_account(account: Any) -> tuple[bool, str]:
+    """Contact Kaggle with a named account's credentials.
+
+    For token accounts, also checks the token really belongs to the stored
+    username (kernel ids are built from it). Returns (ok, message).
+    """
+    from kagglex.accounts import get_active_account, set_active_account
+
+    previous = get_active_account()
+    set_active_account(account)
+    try:
+        api = get_kaggle_api()
+        if account.token and hasattr(api, "_introspect_token"):
+            owner = api._introspect_token(account.token)
+            if not owner:
+                return False, "token is invalid, expired or revoked"
+            if owner.casefold() != account.username.casefold():
+                return False, (
+                    f"token belongs to Kaggle user '{owner}', not '{account.username}' "
+                    "(fix with: kagglex account add ... --force)"
+                )
+        api.kernels_list(mine=True, page_size=1)
+        return True, f"connected as Kaggle user '{account.username}'"
+    except Exception as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status in (401, 403):
+            return False, f"Kaggle rejected the credentials (HTTP {status})"
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        set_active_account(previous)
 
 
 def check_kaggle_health() -> tuple[bool, str]:

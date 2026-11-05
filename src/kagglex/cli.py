@@ -6,6 +6,20 @@ import os
 import sys
 from pathlib import Path
 
+from kagglex.accounts import (
+    AccountError,
+    account_quota,
+    add_account,
+    find_account,
+    get_accounts_file,
+    load_accounts,
+    looks_like_legacy_key,
+    remove_account,
+    resolve_account,
+    resolve_account_for_kernel,
+    set_active_account,
+    set_default_account,
+)
 from kagglex.api import KaggleRunner
 from kagglex.client import (
     append_experiment_record,
@@ -15,10 +29,11 @@ from kagglex.client import (
     get_kernel_status,
     pull_kernel_output,
     stream_kernel_logs,
+    verify_account,
 )
 from kagglex.config import DatasetConfig, RunConfig, load_project_config
 from kagglex.dataset import create_dataset_metadata, push_dataset
-from kagglex.history import get_quota_usage, list_runs, update_run
+from kagglex.history import get_quota_usage, kernel_owner, list_runs, update_run
 from kagglex.workspace import find_repo_root
 
 logger = logging.getLogger("kagglex")
@@ -141,6 +156,16 @@ def handle_run(args: argparse.Namespace) -> int:
     if poll_interval == 20 and "poll_interval" in proj_cfg:
         poll_interval = int(proj_cfg["poll_interval"])
 
+    # 8. Kaggle account: --account > [tool.kagglex] account > default account > kaggle.json
+    gpu_limit, tpu_limit = _quota_limits(proj_cfg)
+    acct = resolve_account(
+        args.account or proj_cfg.get("account"),
+        accelerator=gpu_type,
+        gpu_limit_hours=gpu_limit,
+        tpu_limit_hours=tpu_limit,
+    )
+    set_active_account(acct)
+
     config = RunConfig(
         command=cmd,
         title=title,
@@ -163,11 +188,17 @@ def handle_run(args: argparse.Namespace) -> int:
         auto_dataset=auto_dataset,
         auto_dataset_slug=auto_dataset_slug,
         poll_interval=poll_interval,
+        account=acct.name if acct else None,
     )
 
-    # Check estimated quota warning
+    # Check estimated quota warning (per account when one is selected)
     try:
-        usage = get_quota_usage(window_days=7)
+        usage = get_quota_usage(
+            window_days=7,
+            gpu_limit_hours=gpu_limit,
+            tpu_limit_hours=tpu_limit,
+            username=acct.username if acct else None,
+        )
         if config.gpu_type in {"t4-2x", "p100"}:
             gpu_info = usage["gpu"]
             if gpu_info["used_pct"] >= 90.0 or gpu_info["remaining_hours"] < 2.0:
@@ -237,12 +268,26 @@ def handle_push(args: argparse.Namespace) -> int:
     return handle_run(args)
 
 
+def _resolve_kernel(args: argparse.Namespace) -> str:
+    """Activate the account owning `args.kernel` and return the full 'user/slug' id."""
+    acct, known_id = resolve_account_for_kernel(
+        args.kernel, explicit=getattr(args, "account", None)
+    )
+    set_active_account(acct)
+
+    kernel_id = args.kernel
+    if "/" in kernel_id:
+        return kernel_id
+    if known_id and (
+        acct is None or kernel_owner(known_id).casefold() == acct.username.casefold()
+    ):
+        return known_id
+    return f"{get_authenticated_username()}/{kernel_id}"
+
+
 def handle_status(args: argparse.Namespace) -> int:
     """Handle 'status' subcommand."""
-    kernel_id = args.kernel
-    if "/" not in kernel_id:
-        user = get_authenticated_username()
-        kernel_id = f"{user}/{kernel_id}"
+    kernel_id = _resolve_kernel(args)
 
     status_info = get_kernel_status(kernel_id)
     logger.info("Kernel '%s' status: %s", kernel_id, status_info["status"].upper())
@@ -262,10 +307,7 @@ def handle_status(args: argparse.Namespace) -> int:
 
 def handle_logs(args: argparse.Namespace) -> int:
     """Handle 'logs' subcommand."""
-    kernel_id = args.kernel
-    if "/" not in kernel_id:
-        user = get_authenticated_username()
-        kernel_id = f"{user}/{kernel_id}"
+    kernel_id = _resolve_kernel(args)
 
     stream_kernel_logs(kernel_id)
     return 0
@@ -273,10 +315,7 @@ def handle_logs(args: argparse.Namespace) -> int:
 
 def handle_cancel(args: argparse.Namespace) -> int:
     """Handle 'cancel' subcommand."""
-    kernel_id = args.kernel
-    if "/" not in kernel_id:
-        user = get_authenticated_username()
-        kernel_id = f"{user}/{kernel_id}"
+    kernel_id = _resolve_kernel(args)
 
     ok = cancel_kernel(kernel_id)
     if ok:
@@ -288,10 +327,7 @@ def handle_cancel(args: argparse.Namespace) -> int:
 
 def handle_pull(args: argparse.Namespace) -> int:
     """Handle 'pull' subcommand."""
-    kernel_id = args.kernel
-    if "/" not in kernel_id:
-        user = get_authenticated_username()
-        kernel_id = f"{user}/{kernel_id}"
+    kernel_id = _resolve_kernel(args)
 
     output_dir = Path(args.output_dir)
     pull_kernel_output(
@@ -304,33 +340,244 @@ def handle_pull(args: argparse.Namespace) -> int:
     return 0
 
 
-def handle_list(args: argparse.Namespace) -> int:
-    """Handle 'list' subcommand."""
-    runs = list_runs(limit=args.limit)
-
-    if not runs:
-        logger.info("No recorded runs found.")
-        return 0
-
-    # Format tabular output
-    headers = ["SLUG / KERNEL ID", "STATUS", "ACCELERATOR", "SUBMITTED AT", "DURATION"]
-    rows = []
-    for r in runs:
-        dur = f"{r.duration_sec:.1f}s" if r.duration_sec else "-"
-        rows.append([r.kernel_id, r.status.upper(), r.accelerator, r.submitted_at, dur])
-
+def _print_table(headers: list[str], rows: list[list[str]]) -> None:
+    """Write a left-aligned plain-text table to stdout."""
     col_widths = [len(h) for h in headers]
     for row in rows:
         for i, val in enumerate(row):
             col_widths[i] = max(col_widths[i], len(val))
 
     fmt = "  ".join(f"{{:<{w}}}" for w in col_widths)
-    sys.stdout.write("\n")
-    sys.stdout.write(fmt.format(*headers) + "\n")
+    sys.stdout.write(fmt.format(*headers).rstrip() + "\n")
     sys.stdout.write("  ".join("-" * w for w in col_widths) + "\n")
     for row in rows:
-        sys.stdout.write(fmt.format(*row) + "\n")
+        sys.stdout.write(fmt.format(*row).rstrip() + "\n")
+
+
+def _quota_limits(proj_cfg: dict) -> tuple[float, float]:
+    """Weekly GPU/TPU hour limits from config (defaults 30 / 20)."""
+    return (
+        float(proj_cfg.get("gpu_weekly_limit_hours", 30.0)),
+        float(proj_cfg.get("tpu_weekly_limit_hours", 20.0)),
+    )
+
+
+def handle_list(args: argparse.Namespace) -> int:
+    """Handle 'list' subcommand (or 'list --credit' for the account overview)."""
+    if args.credit:
+        return handle_account_list(args)
+
+    runs = list_runs(limit=args.limit)
+
+    if not runs:
+        logger.info("No recorded runs found.")
+        return 0
+
+    headers = [
+        "SLUG / KERNEL ID",
+        "ACCOUNT",
+        "STATUS",
+        "ACCELERATOR",
+        "SUBMITTED AT",
+        "DURATION",
+    ]
+    rows = []
+    for r in runs:
+        dur = f"{r.duration_sec:.1f}s" if r.duration_sec else "-"
+        rows.append(
+            [
+                r.kernel_id,
+                r.account or "-",
+                r.status.upper(),
+                r.accelerator,
+                r.submitted_at,
+                dur,
+            ]
+        )
+
     sys.stdout.write("\n")
+    _print_table(headers, rows)
+    sys.stdout.write("\n")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 'account' subcommands
+# ---------------------------------------------------------------------------
+
+
+def _read_secret(prompt: str) -> str:
+    import getpass
+
+    if not sys.stdin.isatty():
+        return sys.stdin.readline().strip()
+    return getpass.getpass(prompt).strip()
+
+
+def handle_account_add(args: argparse.Namespace) -> int:
+    """Handle 'account add': register a named Kaggle account."""
+    username = args.username
+    key, token = args.key, args.token
+
+    if args.json:
+        import json
+
+        json_path = Path(args.json).expanduser()
+        try:
+            creds = json.loads(json_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            logger.error("Could not read kaggle.json file %s: %s", json_path, e)
+            return 1
+        username = username or creds.get("username")
+        key = creds.get("key")
+        if not key:
+            logger.error("%s has no 'key' field.", json_path)
+            return 1
+
+    if not username:
+        logger.error("--username is required (or use --json path/to/kaggle.json).")
+        return 1
+
+    if not key and not token:
+        secret = _read_secret(
+            f"Kaggle API key or token for '{username}' (input hidden): "
+        )
+        if not secret:
+            logger.error("No API key or token entered.")
+            return 1
+        if looks_like_legacy_key(secret):
+            key = secret
+        else:
+            token = secret
+
+    try:
+        acct = add_account(
+            args.name,
+            username=username,
+            key=key,
+            token=token,
+            make_default=args.default,
+            overwrite=args.force,
+        )
+    except ValueError as e:
+        logger.error("%s", e)
+        return 1
+
+    _, default = load_accounts()
+    suffix = " (default)" if default == acct.name else ""
+    sys.stdout.write(
+        f"Added account '{acct.name}' -> Kaggle user '{acct.username}' "
+        f"[{acct.auth_type}]{suffix}.\nSaved to {get_accounts_file()} (chmod 600).\n"
+    )
+    if args.verify:
+        return _test_accounts([acct])
+    return 0
+
+
+def _test_accounts(accts: list) -> int:
+    """Check each account against Kaggle and print one result line per account."""
+    failed = 0
+    for acct in accts:
+        ok, message = verify_account(acct)
+        failed += not ok
+        mark = "OK  " if ok else "FAIL"
+        sys.stdout.write(f"[{mark}] {acct.name}: {message}\n")
+    return 1 if failed else 0
+
+
+def handle_account_test(args: argparse.Namespace) -> int:
+    """Handle 'account test': verify credentials by contacting Kaggle."""
+    accounts, _ = load_accounts()
+    if not accounts:
+        sys.stdout.write("No Kaggle accounts registered.\n")
+        return 1
+    if args.names:
+        accts = [find_account(n, accounts) for n in args.names]
+    else:
+        accts = [accounts[n] for n in sorted(accounts, key=str.casefold)]
+    return _test_accounts(accts)
+
+
+def handle_account_list(args: argparse.Namespace) -> int:
+    """Handle 'account list' / 'list --credit': accounts with estimated quota."""
+    accounts, default = load_accounts()
+    if not accounts:
+        sys.stdout.write(
+            "No Kaggle accounts registered.\n"
+            "Add one with: kagglex account add <name> --username <kaggle-username>\n"
+        )
+        return 0
+
+    proj_cfg = load_project_config(find_repo_root())
+    cfg_gpu, cfg_tpu = _quota_limits(proj_cfg)
+    days = getattr(args, "days", None) or int(proj_cfg.get("quota_days", 7))
+    gpu_limit = getattr(args, "gpu_limit", None) or cfg_gpu
+    tpu_limit = getattr(args, "tpu_limit", None) or cfg_tpu
+
+    headers = [
+        "",
+        "NAME",
+        "KAGGLE USER",
+        "AUTH",
+        "GPU USED",
+        "GPU LEFT",
+        "TPU USED",
+        "TPU LEFT",
+        "RUNS",
+    ]
+    rows = []
+    for name in sorted(accounts, key=str.casefold):
+        acct = accounts[name]
+        usage = account_quota(acct, days, gpu_limit, tpu_limit)
+        gpu, tpu = usage["gpu"], usage["tpu"]
+        rows.append(
+            [
+                "*" if name == default else "",
+                name,
+                acct.username,
+                acct.auth_type,
+                f"{gpu['used_hours']:.2f}h",
+                f"{gpu['remaining_hours']:.2f}/{gpu['limit_hours']:.0f}h",
+                f"{tpu['used_hours']:.2f}h",
+                f"{tpu['remaining_hours']:.2f}/{tpu['limit_hours']:.0f}h",
+                str(len(usage["runs"])),
+            ]
+        )
+
+    sys.stdout.write(f"\nKaggle accounts - estimated quota, past {days} days:\n\n")
+    _print_table(headers, rows)
+    sys.stdout.write(
+        "\n* = default account. Usage is estimated from runs submitted via kagglex "
+        "on this machine\n  (runs finished while kagglex was waiting); Kaggle has "
+        "no API for remaining quota.\n\n"
+    )
+    return 0
+
+
+def handle_account_use(args: argparse.Namespace) -> int:
+    """Handle 'account use': set the default account."""
+    try:
+        acct = set_default_account(args.name)
+    except AccountError as e:
+        logger.error("%s", e)
+        return 1
+    sys.stdout.write(f"Default account is now '{acct.name}' ({acct.username}).\n")
+    return 0
+
+
+def handle_account_remove(args: argparse.Namespace) -> int:
+    """Handle 'account remove': delete a stored account."""
+    try:
+        acct = remove_account(args.name)
+    except AccountError as e:
+        logger.error("%s", e)
+        return 1
+    _, default = load_accounts()
+    sys.stdout.write(f"Removed account '{acct.name}' ({acct.username}).\n")
+    if default:
+        sys.stdout.write(f"Default account: '{default}'.\n")
+    else:
+        sys.stdout.write("No default account set (use: kagglex account use <name>).\n")
     return 0
 
 
@@ -350,16 +597,28 @@ def handle_quota(args: argparse.Namespace) -> int:
         else float(proj_cfg.get("tpu_weekly_limit_hours", 20.0))
     )
 
+    acct = None
+    if args.account:
+        try:
+            acct = find_account(args.account, load_accounts()[0])
+        except AccountError as e:
+            logger.error("%s", e)
+            return 1
+
     usage = get_quota_usage(
         window_days=args.days,
         gpu_limit_hours=gpu_limit,
         tpu_limit_hours=tpu_limit,
+        username=acct.username if acct else None,
     )
 
     gpu_info = usage["gpu"]
     tpu_info = usage["tpu"]
 
-    sys.stdout.write(f"\nKaggle Accelerator Quota Usage (Past {args.days} Days):\n\n")
+    scope = f" - account '{acct.name}' ({acct.username})" if acct else ""
+    sys.stdout.write(
+        f"\nKaggle Accelerator Quota Usage (Past {args.days} Days){scope}:\n\n"
+    )
 
     headers = [
         "ACCELERATOR",
@@ -436,6 +695,8 @@ def handle_dataset_push(args: argparse.Namespace) -> int:
     if not data_dir.exists():
         logger.error("Dataset directory does not exist: %s", data_dir)
         return 1
+
+    set_active_account(resolve_account(args.account))
 
     config = DatasetConfig(
         title=args.title or data_dir.name,
@@ -545,14 +806,27 @@ def handle_exec(args: argparse.Namespace) -> int:
     return 0 if res.get("success") else 1
 
 
+def _package_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("kagglex")
+    except PackageNotFoundError:
+        return "unknown"
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Construct CLI argument parser for kagglex."""
     parser = argparse.ArgumentParser(
         prog="kagglex",
         description="Execute local Python code, modules, and experiments seamlessly on Kaggle GPUs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable verbose debug logging"
+    )
+    parser.add_argument(
+        "-V", "--version", action="version", version=f"%(prog)s {_package_version()}"
     )
 
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
@@ -714,6 +988,14 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Stage all files locally without submitting to Kaggle",
     )
+    run_p.add_argument(
+        "--account",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help="Named Kaggle account to run on, or 'auto' for the one with most "
+        "remaining quota (default: the default account)",
+    )
 
     # 2. 'push' subcommand
     push_p = subparsers.add_parser(
@@ -724,22 +1006,37 @@ def create_parser() -> argparse.ArgumentParser:
         if action.dest not in {"help", "subcommand", "no_wait", "stream"}:
             push_p._add_action(action)
 
+    kernel_account_help = (
+        "Kaggle account to use (default: the account that submitted the run)"
+    )
+
     # 3. 'status' subcommand
     status_p = subparsers.add_parser("status", help="Check status of a Kaggle kernel.")
     status_p.add_argument("kernel", type=str, help="Kernel ID or slug")
+    status_p.add_argument("--account", metavar="NAME", help=kernel_account_help)
 
     # 4. 'logs' subcommand
     logs_p = subparsers.add_parser("logs", help="View remote logs for a Kaggle kernel.")
     logs_p.add_argument("kernel", type=str, help="Kernel ID or slug")
+    logs_p.add_argument("--account", metavar="NAME", help=kernel_account_help)
 
     # 5. 'cancel' subcommand
     cancel_p = subparsers.add_parser("cancel", help="Cancel a running Kaggle kernel.")
     cancel_p.add_argument("kernel", type=str, help="Kernel ID or slug")
+    cancel_p.add_argument("--account", metavar="NAME", help=kernel_account_help)
 
     # 6. 'list' subcommand
-    list_p = subparsers.add_parser("list", help="List recent Kaggle runs.")
+    list_p = subparsers.add_parser(
+        "list", help="List recent Kaggle runs (or accounts with --credit)."
+    )
     list_p.add_argument(
         "--limit", type=int, default=20, help="Number of runs to display (default: 20)"
+    )
+    list_p.add_argument(
+        "--credit",
+        action="store_true",
+        help="Show Kaggle accounts and their estimated GPU/TPU quota instead "
+        "(same as 'kagglex account list')",
     )
 
     # 7. 'pull' subcommand
@@ -747,6 +1044,7 @@ def create_parser() -> argparse.ArgumentParser:
         "pull", help="Download outputs from completed kernel."
     )
     pull_p.add_argument("kernel", type=str, help="Kernel ID or slug")
+    pull_p.add_argument("--account", metavar="NAME", help=kernel_account_help)
     pull_p.add_argument(
         "--output-dir",
         type=str,
@@ -798,6 +1096,11 @@ def create_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Stage dataset metadata locally without pushing",
+    )
+    ds_push.add_argument(
+        "--account",
+        metavar="NAME",
+        help="Kaggle account that will own the dataset (default: the default account)",
     )
 
     # 9. 'exec' subcommand for interactive proxy execution
@@ -895,8 +1198,123 @@ def create_parser() -> argparse.ArgumentParser:
         default=20.0,
         help="Weekly TPU quota limit in hours (default: 20.0)",
     )
+    quota_p.add_argument(
+        "--account",
+        metavar="NAME",
+        help="Only count runs of this named account (default: all runs)",
+    )
 
+    # 11. 'account' subcommand
+    acct_p = subparsers.add_parser(
+        "account",
+        help="Manage named Kaggle accounts (add, test, list, use, remove).",
+    )
+    acct_sub = acct_p.add_subparsers(dest="account_action", required=True)
+
+    acct_add = acct_sub.add_parser(
+        "add",
+        help="Register a Kaggle account under a name (prompts for the key if omitted).",
+    )
+    acct_add.add_argument("name", help="Friendly account name, e.g. Phong")
+    acct_add.add_argument(
+        "--username", help="Kaggle username (required unless --json is used)"
+    )
+    acct_secret = acct_add.add_mutually_exclusive_group()
+    acct_secret.add_argument(
+        "--key", help="Legacy API key from kaggle.json (prefer the hidden prompt)"
+    )
+    acct_secret.add_argument(
+        "--token", help="New-style Kaggle API token (prefer the hidden prompt)"
+    )
+    acct_secret.add_argument(
+        "--json",
+        metavar="PATH",
+        help="Import username and key from a kaggle.json file",
+    )
+    acct_add.add_argument(
+        "--default", action="store_true", help="Make this the default account"
+    )
+    acct_add.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing account with this name",
+    )
+    acct_add.add_argument(
+        "--verify",
+        action="store_true",
+        help="Test the connection to Kaggle right after saving",
+    )
+
+    acct_test = acct_sub.add_parser(
+        "test", help="Test the connection to Kaggle for accounts (default: all)."
+    )
+    acct_test.add_argument(
+        "names", nargs="*", metavar="NAME", help="Account names to test"
+    )
+
+    acct_list = acct_sub.add_parser(
+        "list", help="Show accounts with estimated GPU/TPU quota used and remaining."
+    )
+    acct_list.add_argument(
+        "--days", type=int, default=None, help="Rolling window in days (default: 7)"
+    )
+    acct_list.add_argument(
+        "--gpu-limit",
+        type=float,
+        default=None,
+        help="Weekly GPU quota per account in hours (default: 30)",
+    )
+    acct_list.add_argument(
+        "--tpu-limit",
+        type=float,
+        default=None,
+        help="Weekly TPU quota per account in hours (default: 20)",
+    )
+
+    acct_use = acct_sub.add_parser("use", help="Set the default account.")
+    acct_use.add_argument("name", help="Account name")
+
+    acct_rm = acct_sub.add_parser("remove", help="Delete a stored account.")
+    acct_rm.add_argument("name", help="Account name")
+
+    parser.epilog = _build_flag_reference(subparsers)
     return parser
+
+
+def _build_flag_reference(subparsers: argparse._SubParsersAction) -> str:
+    """Render every subcommand with its arguments for the top-level --help."""
+    lines = ["full reference (run 'kagglex <command> --help' for details):", ""]
+
+    def describe(prefix: str, sub: argparse._SubParsersAction) -> None:
+        helps = {a.dest: a.help for a in sub._choices_actions}
+        for name, p in sub.choices.items():
+            lines.append(f"  kagglex {prefix}{name}  -  {helps.get(name, '')}")
+            nested = None
+            for action in p._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    nested = action
+                    continue
+                if isinstance(action, argparse._HelpAction):
+                    continue
+                if action.option_strings:
+                    label = ", ".join(action.option_strings)
+                    if action.nargs != 0:
+                        label += f" {action.metavar or action.dest.upper()}"
+                else:
+                    label = action.metavar or action.dest.upper()
+                lines.append(f"      {label:<28} {action.help or ''}")
+            if nested is not None:
+                describe(f"{prefix}{name} ", nested)
+            lines.append("")
+
+    describe("", subparsers)
+    lines += [
+        "examples:",
+        "  kagglex account add Phong --username phong_kg      # prompts for key",
+        "  kagglex list --credit",
+        "  kagglex run --file train.py --account auto --gpu t4-2x",
+    ]
+    return "\n".join(lines)
 
 
 def main(args_list: list[str] | None = None) -> int:
@@ -929,9 +1347,20 @@ def main(args_list: list[str] | None = None) -> int:
         elif args.subcommand == "dataset":
             if args.dataset_action == "push":
                 return handle_dataset_push(args)
+        elif args.subcommand == "account":
+            return {
+                "add": handle_account_add,
+                "list": handle_account_list,
+                "use": handle_account_use,
+                "remove": handle_account_remove,
+                "test": handle_account_test,
+            }[args.account_action](args)
         else:
             parser.print_help()
             return 1
+    except AccountError as e:
+        logger.error("%s", e)
+        return 1
     except Exception as e:
         logger.exception("Operation failed: %s", e)
         return 1

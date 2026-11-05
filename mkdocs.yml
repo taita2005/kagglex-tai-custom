@@ -63,6 +63,7 @@ nav:
       - Interactive REPL: user-guide/interactive-repl.md
       - Datasets & Payloads: user-guide/datasets.md
       - Quota Tracking: user-guide/quota.md
+      - Multiple Accounts: user-guide/accounts.md
       - Configuration Hierarchy: user-guide/configuration.md
       - Workspaces & Packaging: user-guide/workspaces.md
   - CLI Reference: cli-reference.md

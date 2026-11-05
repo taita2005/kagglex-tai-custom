@@ -7,6 +7,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from kagglex.accounts import (
+    Account,
+    resolve_account,
+    resolve_account_for_kernel,
+    set_active_account,
+)
 from kagglex.bootstrap import generate_bootstrap_script
 from kagglex.client import (
     cancel_kernel,
@@ -19,7 +25,7 @@ from kagglex.client import (
 )
 from kagglex.config import DatasetConfig, RunConfig
 from kagglex.dataset import create_dataset_metadata, push_dataset
-from kagglex.history import RunRecord, get_run, list_runs, record_run, update_run
+from kagglex.history import RunRecord, list_runs, record_run, update_run
 from kagglex.packager import (
     create_kernel_metadata,
     package_local_data,
@@ -135,8 +141,22 @@ class KaggleRunner:
         self.repo_root = (repo_root or find_repo_root()).resolve()
         self.staging_dir = staging_dir or (self.repo_root / ".kagglex" / "staging")
 
+    def use_account(self, config: RunConfig) -> Account | None:
+        """Resolve `config.account` ("Phong", "auto", or None for default) and activate it.
+
+        After resolution `config.account` holds the concrete account name, so a
+        later call (e.g. stage() then run()) never re-picks a different "auto" account.
+        """
+        acct = resolve_account(config.account, accelerator=config.gpu_type)
+        if acct is not None or config.account is not None:
+            set_active_account(acct)
+        if acct is not None:
+            config.account = acct.name
+        return acct
+
     def stage(self, config: RunConfig) -> Path:
         """Stage project files, payloads, and bootstrap scripts locally."""
+        self.use_account(config)
         slug = config.slug or "run"
         staging_base = self.staging_dir / slug
         staging_base.mkdir(parents=True, exist_ok=True)
@@ -277,6 +297,7 @@ class KaggleRunner:
             status="queued",
             url=kernel_url,
             project_path=str(self.repo_root),
+            account=config.account,
         )
         record_run(rec)
 
@@ -297,7 +318,7 @@ class KaggleRunner:
         return list_runs(limit=limit)
 
     def cancel(self, kernel_id_or_slug: str) -> bool:
-        """Cancel a run by kernel id or slug."""
-        rec = get_run(kernel_id_or_slug)
-        kernel_id = rec.kernel_id if rec else kernel_id_or_slug
-        return cancel_kernel(kernel_id)
+        """Cancel a run by kernel id or slug (using the account that owns it)."""
+        acct, known_id = resolve_account_for_kernel(kernel_id_or_slug)
+        set_active_account(acct)
+        return cancel_kernel(known_id or kernel_id_or_slug)

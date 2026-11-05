@@ -25,6 +25,12 @@ class RunRecord:
     url: str | None = None
     error_message: str | None = None
     project_path: str | None = None
+    account: str | None = None
+
+
+def kernel_owner(kernel_id: str) -> str:
+    """Kaggle username that owns a kernel id ('user/slug' -> 'user')."""
+    return kernel_id.split("/", 1)[0] if "/" in kernel_id else ""
 
 
 def get_history_file(history_path: Path | None = None) -> Path:
@@ -77,20 +83,15 @@ def save_all_records(
 
 
 def record_run(record: RunRecord, history_path: Path | None = None) -> None:
-    """Append or update a run in global history."""
+    """Prepend a run to global history (newest first).
+
+    Every submission is kept as its own record, even when the slug repeats:
+    re-running a kernel (or the same slug on another account) must not erase
+    the earlier run's duration from quota accounting. Lookups by slug or
+    kernel id resolve to the newest matching record.
+    """
     records = load_all_records(history_path)
-    record_dict = asdict(record)
-
-    # Update if already exists
-    updated = False
-    for i, r in enumerate(records):
-        if r.get("kernel_id") == record.kernel_id or r.get("slug") == record.slug:
-            records[i] = record_dict
-            updated = True
-            break
-
-    if not updated:
-        records.insert(0, record_dict)
+    records.insert(0, asdict(record))
 
     save_all_records(records, history_path)
     logger.debug(
@@ -182,6 +183,7 @@ def get_quota_usage(
     gpu_limit_hours: float = 30.0,
     tpu_limit_hours: float = 20.0,
     current_time: float | None = None,
+    username: str | None = None,
 ) -> dict[str, Any]:
     """Calculate GPU and TPU accelerator quota usage across a rolling time window.
 
@@ -191,6 +193,8 @@ def get_quota_usage(
         gpu_limit_hours: Weekly GPU quota limit in hours (default: 30.0).
         tpu_limit_hours: Weekly TPU quota limit in hours (default: 20.0).
         current_time: Optional reference epoch timestamp (default: current time).
+        username: Only count runs owned by this Kaggle username (the kernel id
+            prefix), so each account's quota is tracked separately.
 
     Returns:
         Dictionary containing aggregated hours, limits, percentages, and run items.
@@ -209,6 +213,12 @@ def get_quota_usage(
     for r in records:
         sub_time = parse_timestamp(r.get("submitted_at", ""))
         if sub_time is None or sub_time < cutoff_epoch:
+            continue
+        if (
+            username is not None
+            and kernel_owner(str(r.get("kernel_id", ""))).casefold()
+            != username.casefold()
+        ):
             continue
 
         accel = str(r.get("accelerator", "none")).lower()

@@ -6,6 +6,21 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path_factory, monkeypatch):
+    """Never touch the real ~/.kagglex (run history, accounts.toml) or Kaggle creds."""
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    for var in ("KAGGLE_API_TOKEN", "KAGGLE_USERNAME", "KAGGLE_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+    from kagglex.accounts import set_active_account
+
+    set_active_account(None)
+    yield home
+    set_active_account(None)
+
+
 @pytest.fixture
 def mock_kaggle_api():
     """Mock the kaggle API client globally for offline tests."""

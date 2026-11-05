@@ -8,6 +8,18 @@ Execute local Python code, modules, and experiments seamlessly on Kaggle GPUs an
 [![License](https://img.shields.io/pypi/l/kagglex)](https://github.com/Hari31416/kagglex/blob/main/LICENSE)
 [![CI](https://github.com/Hari31416/kagglex/actions/workflows/ci.yml/badge.svg)](https://github.com/Hari31416/kagglex/actions/workflows/ci.yml)
 
+> **This is a fork** of [Hari31416/kagglex](https://github.com/Hari31416/kagglex) (MIT). It adds multi-account support for teams that pool Kaggle accounts: named accounts, per-account GPU/TPU quota estimates, and `--account auto`. See [Multiple Kaggle Accounts](docs/user-guide/accounts.md).
+>
+> Install this fork (needs [uv](https://docs.astral.sh/uv/)):
+>
+> ```bash
+> uv tool install git+https://github.com/taita2005/kagglex-tai-custom.git
+> kagglex account add <name> --username <kaggle-username> --verify   # prompts for the API token
+> kagglex list --credit
+> ```
+>
+> Each person's accounts and tokens stay on their own machine in `~/.kagglex/accounts.toml`. Nothing is shared through this repo.
+
 ## Overview
 
 `kagglex` enables machine learning practitioners and researchers to transparently package and dispatch local Python code, standalone scripts, or complete packages to Kaggle's cloud GPU and TPU environments without tedious manual uploading or notebook maintenance.
@@ -22,6 +34,7 @@ Execute local Python code, modules, and experiments seamlessly on Kaggle GPUs an
 - Secure Kaggle Secrets integration for WandB, HuggingFace, and custom credentials
 - Local experiment history repository for tracking past runs, statuses, and durations
 - Interactive REPL execution on active Kaggle notebooks via Jupyter proxy URL
+- Multiple named Kaggle accounts with per-account quota estimates and automatic account selection
 - Programmatic Python SDK alongside the `kagglex` CLI
 
 ## Installation
@@ -96,6 +109,20 @@ kagglex quota --days 7
 ```
 
 Because Kaggle's public API does not expose an endpoint to query remaining weekly quota balances, `kagglex` computes usage locally from run records in `~/.kagglex/runs.json` over a configurable rolling window (default: 7 days). Limit thresholds can be configured via `--gpu-limit` / `--tpu-limit` or in configuration files.
+
+### Multiple Kaggle Accounts
+
+Store several Kaggle accounts under friendly names (handy for teams that pool GPU hours) and pick one per run:
+
+```bash
+kagglex account add Phong --username phong_kg      # prompts for the API key/token
+kagglex account add Tân --json ~/Downloads/kaggle.json
+kagglex list --credit                              # accounts + estimated GPU/TPU left
+kagglex run --file train.py --account Tân          # or --account auto
+kagglex account use Tân                            # change the default account
+```
+
+Credentials live in `~/.kagglex/accounts.toml` (chmod 600). `status`, `logs`, `pull` and `cancel` automatically use the account that submitted the run.
 
 ### Declarative Configuration
 

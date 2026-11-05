@@ -55,6 +55,8 @@ class RunConfig:
     auto_dataset_slug: str | None = None
     poll_interval: int = 20
     timeout_sec: int = 43200
+    # Named kagglex account ("Phong"), "auto", or None for the default account.
+    account: str | None = None
 
     def __post_init__(self) -> None:
         """Validate and normalize configuration parameters."""
